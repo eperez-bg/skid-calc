@@ -14,11 +14,15 @@ from models import (
 
 
 # ============================================================
-# CONSTANTS
+# PHYSICAL CONSTANTS
 # ============================================================
 
 MAX_LOADED_HEIGHT = 87.52
 MAX_SKID_WIDTH = 90.5
+
+# Keep this to prevent absurdly long skids.
+# Set to None if you truly want unlimited skid length.
+MAX_SKID_LENGTH = 96.0
 
 LENGTH_CLEARANCE = 1.97
 WIDTH_CLEARANCE = 1.18
@@ -28,36 +32,33 @@ MIN_OUTPUT_SKID_HEIGHT = 47.24
 WIDTH_STEP = 0.5
 EPS = 1e-9
 
-MAX_INTERNAL_CARTON_WIDTH = MAX_SKID_WIDTH - WIDTH_CLEARANCE
-
 
 # ============================================================
-# BALANCED SUPPORT SETTINGS
+# SUPPORT / PACKING SETTINGS
 # ============================================================
 
-# At least this much of the carton bottom must be supported.
-# 0.90 = 90% supported.
+# Higher = stricter support.
 MIN_SUPPORT_RATIO = 0.90
 
-# Maximum allowed overhang on any one side.
-# 1.0 means no side can hang over support by more than 1 inch.
+# Maximum side overhang allowed.
 MAX_SIDE_OVERHANG = 1.0
 
-# This affects scoring.
-# Higher number means the optimizer will avoid overhang more aggressively.
-OVERHANG_SCORE_WEIGHT = 1000
+# Cartons can share a layer if their heights are close enough.
+HEIGHT_MATCH_TOLERANCE = 0.75
+
+# Scoring weights.
+OVERHANG_SCORE_WEIGHT = 3000.0
+SUPPORT_WASTE_WEIGHT = 0.10
+CENTER_OFFSET_WEIGHT = 20.0
+HEIGHT_WEIGHT = 75.0
 
 
 # ============================================================
-# TEMPORARY GEOMETRY MODELS
+# GEOMETRY MODELS
 # ============================================================
 
 @dataclass(frozen=True)
 class Rect:
-    """
-    Simple 2D rectangle used for support checking.
-    """
-
     x: float
     y: float
     length: float
@@ -78,16 +79,14 @@ class Rect:
 
 @dataclass(frozen=True)
 class CandidatePosition:
-    """
-    A possible x/y location inside a layer.
-    """
-
     x: float
     y: float
     new_layer_length: float
     new_layer_width: float
     support_ratio: float
     side_overhang: float
+    center_offset: float
+    support_waste: float
 
 
 # ============================================================
@@ -96,7 +95,7 @@ class CandidatePosition:
 
 def get_orientations(carton: Carton):
     """
-    Allows flat rotation only.
+    Flat rotation only.
 
     Allowed:
         L x W x H
@@ -123,7 +122,7 @@ def get_orientations(carton: Carton):
 
 
 # ============================================================
-# BASIC MEASUREMENT HELPERS
+# MEASUREMENT HELPERS
 # ============================================================
 
 def layer_used_length(layer: Layer) -> float:
@@ -158,8 +157,37 @@ def current_actual_height(layers: list[Layer]) -> float:
     return sum(layer.height for layer in layers)
 
 
+def final_skid_length(internal_length: float) -> float:
+    return internal_length + LENGTH_CLEARANCE
+
+
+def final_skid_width(internal_width: float) -> float:
+    return internal_width + WIDTH_CLEARANCE
+
+
+def max_internal_width() -> float:
+    return MAX_SKID_WIDTH - WIDTH_CLEARANCE
+
+
+def max_internal_length() -> float | None:
+    if MAX_SKID_LENGTH is None:
+        return None
+
+    return MAX_SKID_LENGTH - LENGTH_CLEARANCE
+
+
+def is_within_skid_limits(skid_length: float, skid_width: float) -> bool:
+    if skid_width > MAX_SKID_WIDTH + EPS:
+        return False
+
+    if MAX_SKID_LENGTH is not None and skid_length > MAX_SKID_LENGTH + EPS:
+        return False
+
+    return True
+
+
 # ============================================================
-# RECTANGLE / COLLISION HELPERS
+# COLLISION HELPERS
 # ============================================================
 
 def rectangles_overlap(
@@ -191,10 +219,6 @@ def has_collision(
     length: float,
     width: float,
 ) -> bool:
-    """
-    Returns True if this rectangle overlaps anything already in the layer.
-    """
-
     for placement in layer.placements:
         if rectangles_overlap(x, y, length, width, placement):
             return True
@@ -202,13 +226,11 @@ def has_collision(
     return False
 
 
+# ============================================================
+# SUPPORT HELPERS
+# ============================================================
+
 def intersection_rect(a: Rect, b: Rect) -> tuple[float, float, float, float] | None:
-    """
-    Returns the intersection rectangle as x1, y1, x2, y2.
-
-    Returns None if the rectangles do not overlap.
-    """
-
     x1 = max(a.x, b.x)
     y1 = max(a.y, b.y)
     x2 = min(a.x2, b.x2)
@@ -222,9 +244,7 @@ def intersection_rect(a: Rect, b: Rect) -> tuple[float, float, float, float] | N
 
 def union_area(rects: list[tuple[float, float, float, float]]) -> float:
     """
-    Calculates the union area of overlapping rectangles.
-
-    This prevents double-counting support area when two support rectangles overlap.
+    Calculates union area so overlapping support zones are not double-counted.
     """
 
     if not rects:
@@ -232,7 +252,7 @@ def union_area(rects: list[tuple[float, float, float, float]]) -> float:
 
     xs = sorted(set([r[0] for r in rects] + [r[2] for r in rects]))
 
-    area = 0.0
+    total_area = 0.0
 
     for i in range(len(xs) - 1):
         x_left = xs[i]
@@ -241,56 +261,52 @@ def union_area(rects: list[tuple[float, float, float, float]]) -> float:
         if x_right <= x_left + EPS:
             continue
 
-        active_y_intervals = []
+        intervals = []
 
         for rx1, ry1, rx2, ry2 in rects:
             if rx1 <= x_left + EPS and rx2 >= x_right - EPS:
-                active_y_intervals.append((ry1, ry2))
+                intervals.append((ry1, ry2))
 
-        if not active_y_intervals:
+        if not intervals:
             continue
 
-        active_y_intervals.sort()
+        intervals.sort()
 
         merged = []
-        current_start, current_end = active_y_intervals[0]
+        start, end = intervals[0]
 
-        for start, end in active_y_intervals[1:]:
-            if start <= current_end + EPS:
-                current_end = max(current_end, end)
+        for next_start, next_end in intervals[1:]:
+            if next_start <= end + EPS:
+                end = max(end, next_end)
             else:
-                merged.append((current_start, current_end))
-                current_start, current_end = start, end
+                merged.append((start, end))
+                start, end = next_start, next_end
 
-        merged.append((current_start, current_end))
+        merged.append((start, end))
 
         covered_y = sum(end - start for start, end in merged)
-        area += (x_right - x_left) * covered_y
+        total_area += (x_right - x_left) * covered_y
 
-    return area
+    return total_area
 
-
-# ============================================================
-# SUPPORT CHECKING
-# ============================================================
 
 def get_support_zones_from_layer(layer: Layer) -> list[Rect]:
     """
-    Builds support rectangles from a layer.
+    Cartons in the layer below become support zones for the layer above.
 
-    Only cartons that reach the layer's full height can support cartons above.
+    Only cartons that reach the full layer height are treated as support.
     """
 
     zones = []
 
-    for placement in layer.placements:
-        if placement.height + EPS >= layer.height:
+    for p in layer.placements:
+        if p.height + EPS >= layer.height:
             zones.append(
                 Rect(
-                    x=placement.x,
-                    y=placement.y,
-                    length=placement.length,
-                    width=placement.width,
+                    x=p.x,
+                    y=p.y,
+                    length=p.length,
+                    width=p.width,
                 )
             )
 
@@ -305,33 +321,25 @@ def check_support(
     support_zones: list[Rect] | None,
 ) -> tuple[bool, float, float]:
     """
-    Checks if a carton is supported enough.
+    Bottom layer is always supported by the skid.
 
-    Bottom layer:
-        Always supported by the skid.
-
-    Upper layer:
-        Must be supported by cartons underneath.
-
-    Returns:
-        valid, support_ratio, max_side_overhang
+    Upper layers must be supported by cartons underneath.
     """
 
-    # Bottom layer is supported by the skid itself.
     if support_zones is None:
         return True, 1.0, 0.0
 
     top_rect = Rect(x=x, y=y, length=length, width=width)
 
     intersections = []
-    overlapping_zones = []
+    touching_zones = []
 
     for zone in support_zones:
         intersection = intersection_rect(top_rect, zone)
 
         if intersection is not None:
             intersections.append(intersection)
-            overlapping_zones.append(zone)
+            touching_zones.append(zone)
 
     if not intersections:
         return False, 0.0, float("inf")
@@ -339,18 +347,17 @@ def check_support(
     supported_area = union_area(intersections)
     support_ratio = supported_area / top_rect.area
 
-    # Build a bounding box around all support zones that touch this carton.
-    support_min_x = min(zone.x for zone in overlapping_zones)
-    support_max_x = max(zone.x2 for zone in overlapping_zones)
-    support_min_y = min(zone.y for zone in overlapping_zones)
-    support_max_y = max(zone.y2 for zone in overlapping_zones)
+    support_min_x = min(zone.x for zone in touching_zones)
+    support_max_x = max(zone.x2 for zone in touching_zones)
+    support_min_y = min(zone.y for zone in touching_zones)
+    support_max_y = max(zone.y2 for zone in touching_zones)
 
     left_overhang = max(0.0, support_min_x - top_rect.x)
     right_overhang = max(0.0, top_rect.x2 - support_max_x)
     front_overhang = max(0.0, support_min_y - top_rect.y)
     back_overhang = max(0.0, top_rect.y2 - support_max_y)
 
-    max_side_overhang = max(
+    side_overhang = max(
         left_overhang,
         right_overhang,
         front_overhang,
@@ -358,11 +365,92 @@ def check_support(
     )
 
     valid = (
-        support_ratio >= MIN_SUPPORT_RATIO - EPS and
-        max_side_overhang <= MAX_SIDE_OVERHANG + EPS
+        support_ratio >= MIN_SUPPORT_RATIO - EPS
+        and side_overhang <= MAX_SIDE_OVERHANG + EPS
     )
 
-    return valid, support_ratio, max_side_overhang
+    return valid, support_ratio, side_overhang
+
+
+def support_center_offset(
+    x: float,
+    y: float,
+    length: float,
+    width: float,
+    support_zones: list[Rect] | None,
+) -> float:
+    """
+    Measures how centered the carton is on the support zones it touches.
+
+    Lower is better.
+    """
+
+    if support_zones is None:
+        return 0.0
+
+    top_rect = Rect(x=x, y=y, length=length, width=width)
+
+    touching_zones = []
+
+    for zone in support_zones:
+        if intersection_rect(top_rect, zone) is not None:
+            touching_zones.append(zone)
+
+    if not touching_zones:
+        return float("inf")
+
+    min_x = min(zone.x for zone in touching_zones)
+    max_x = max(zone.x2 for zone in touching_zones)
+    min_y = min(zone.y for zone in touching_zones)
+    max_y = max(zone.y2 for zone in touching_zones)
+
+    support_center_x = (min_x + max_x) / 2
+    support_center_y = (min_y + max_y) / 2
+
+    carton_center_x = x + length / 2
+    carton_center_y = y + width / 2
+
+    return (
+        abs(carton_center_x - support_center_x)
+        + abs(carton_center_y - support_center_y)
+    )
+
+
+def support_waste(
+    x: float,
+    y: float,
+    length: float,
+    width: float,
+    support_zones: list[Rect] | None,
+) -> float:
+    """
+    Penalizes putting a small carton on a much larger support area.
+
+    Lower is better.
+    """
+
+    if support_zones is None:
+        return 0.0
+
+    top_rect = Rect(x=x, y=y, length=length, width=width)
+
+    touching_zones = []
+
+    for zone in support_zones:
+        if intersection_rect(top_rect, zone) is not None:
+            touching_zones.append(zone)
+
+    if not touching_zones:
+        return float("inf")
+
+    min_x = min(zone.x for zone in touching_zones)
+    max_x = max(zone.x2 for zone in touching_zones)
+    min_y = min(zone.y for zone in touching_zones)
+    max_y = max(zone.y2 for zone in touching_zones)
+
+    support_bbox_area = (max_x - min_x) * (max_y - min_y)
+
+    return max(0.0, support_bbox_area - top_rect.area)
 
 
 # ============================================================
@@ -375,69 +463,98 @@ def candidate_xy_points(
     support_zones: list[Rect] | None,
 ) -> set[tuple[float, float]]:
     """
-    Generates candidate x/y positions.
+    Generates useful x/y candidate points.
 
-    We do not test every possible decimal coordinate.
-    Instead, we test useful places:
-        - origin
-        - right side of existing cartons
-        - behind existing cartons
-        - corners of support zones
+    It uses:
+    - origin
+    - existing carton edges
+    - centered positions
+    - support zone edges
+    - support zone centers
     """
 
-    points = {(0.0, 0.0)}
+    xs = {0.0}
+    ys = {0.0}
 
-    # Points based on cartons already in this layer.
-    for placement in layer.placements:
-        points.add((placement.x + placement.length, placement.y))
-        points.add((placement.x, placement.y + placement.width))
+    for p in layer.placements:
+        xs.add(p.x)
+        ys.add(p.y)
 
-    # Points based on support zones from below.
+        xs.add(p.x + p.length)
+        ys.add(p.y + p.width)
+
+        xs.add(p.x + p.length - orientation.length)
+        ys.add(p.y + p.width - orientation.width)
+
+        xs.add(p.x + (p.length - orientation.length) / 2)
+        ys.add(p.y + (p.width - orientation.width) / 2)
+
     if support_zones is not None:
+        support_min_x = min(zone.x for zone in support_zones)
+        support_max_x = max(zone.x2 for zone in support_zones)
+        support_min_y = min(zone.y for zone in support_zones)
+        support_max_y = max(zone.y2 for zone in support_zones)
+
+        xs.add(support_min_x)
+        ys.add(support_min_y)
+
+        xs.add(support_max_x - orientation.length)
+        ys.add(support_max_y - orientation.width)
+
+        xs.add(
+            support_min_x
+            + ((support_max_x - support_min_x) - orientation.length) / 2
+        )
+        ys.add(
+            support_min_y
+            + ((support_max_y - support_min_y) - orientation.width) / 2
+        )
+
         for zone in support_zones:
-            points.add((zone.x, zone.y))
+            xs.add(zone.x)
+            ys.add(zone.y)
 
-            # Align right edge of carton to right edge of support zone.
-            points.add((zone.x2 - orientation.length, zone.y))
+            xs.add(zone.x2 - orientation.length)
+            ys.add(zone.y2 - orientation.width)
 
-            # Align back edge of carton to back edge of support zone.
-            points.add((zone.x, zone.y2 - orientation.width))
+            xs.add(zone.x + (zone.length - orientation.length) / 2)
+            ys.add(zone.y + (zone.width - orientation.width) / 2)
 
-            # Align both right/back edges.
-            points.add((zone.x2 - orientation.length, zone.y2 - orientation.width))
+            xs.add(zone.x - MAX_SIDE_OVERHANG)
+            ys.add(zone.y - MAX_SIDE_OVERHANG)
 
-            # Align carton centered on the support zone (both axes).
-            center_x = zone.x + (zone.length - orientation.length) / 2.0
-            center_y = zone.y + (zone.width - orientation.width) / 2.0
-            points.add((center_x, center_y))
+            xs.add(zone.x2 - orientation.length + MAX_SIDE_OVERHANG)
+            ys.add(zone.y2 - orientation.width + MAX_SIDE_OVERHANG)
 
-            # Allow small overhang around the zone.
-            points.add((zone.x - MAX_SIDE_OVERHANG, zone.y))
-            points.add((zone.x, zone.y - MAX_SIDE_OVERHANG))
-            points.add((zone.x2 - orientation.length + MAX_SIDE_OVERHANG, zone.y))
-            points.add((zone.x, zone.y2 - orientation.width + MAX_SIDE_OVERHANG))
+    points = set()
 
-    # Remove negative points.
-    cleaned = set()
+    for x in xs:
+        for y in ys:
+            if x >= -EPS and y >= -EPS:
+                points.add((round(max(0.0, x), 4), round(max(0.0, y), 4)))
 
-    for x, y in points:
-        if x >= -EPS and y >= -EPS:
-            cleaned.add((max(0.0, x), max(0.0, y)))
+    return points
 
-    return cleaned
+
+def layer_height_compatible(layer: Layer, orientation: Orientation) -> bool:
+    """
+    Allows cartons with close heights to share the same layer.
+    """
+
+    if orientation.height > layer.height + EPS:
+        return False
+
+    return abs(layer.height - orientation.height) <= HEIGHT_MATCH_TOLERANCE + EPS
 
 
 def find_best_position_in_layer(
     layer: Layer,
     orientation: Orientation,
     width_limit: float,
+    length_limit: float | None,
     support_zones: list[Rect] | None,
 ) -> CandidatePosition | None:
-    """
-    Finds the best x/y position in this layer for this orientation.
-    """
-
-    if orientation.height > layer.height + EPS:
+    if not layer_height_compatible(layer, orientation):
         return None
 
     best_position = None
@@ -445,6 +562,9 @@ def find_best_position_in_layer(
 
     for x, y in candidate_xy_points(layer, orientation, support_zones):
         if y + orientation.width > width_limit + EPS:
+            continue
+
+        if length_limit is not None and x + orientation.length > length_limit + EPS:
             continue
 
         if has_collision(layer, x, y, orientation.length, orientation.width):
@@ -461,6 +581,22 @@ def find_best_position_in_layer(
         if not support_valid:
             continue
 
+        center_offset = support_center_offset(
+            x=x,
+            y=y,
+            length=orientation.length,
+            width=orientation.width,
+            support_zones=support_zones,
+        )
+
+        waste = support_waste(
+            x=x,
+            y=y,
+            length=orientation.length,
+            width=orientation.width,
+            support_zones=support_zones,
+        )
+
         new_layer_length = max(layer_used_length(layer), x + orientation.length)
         new_layer_width = max(layer_used_width(layer), y + orientation.width)
 
@@ -471,14 +607,16 @@ def find_best_position_in_layer(
             new_layer_width=new_layer_width,
             support_ratio=support_ratio,
             side_overhang=side_overhang,
+            center_offset=center_offset,
+            support_waste=waste,
         )
 
-        # Lower score is better.
-        # Prefer compact layer usage, then less overhang, then more support.
         score = (
-            new_layer_length * new_layer_width,
             side_overhang * OVERHANG_SCORE_WEIGHT,
             -support_ratio,
+            waste * SUPPORT_WASTE_WEIGHT,
+            center_offset * CENTER_OFFSET_WEIGHT,
+            new_layer_length * new_layer_width,
             new_layer_length,
             new_layer_width,
         )
@@ -501,44 +639,32 @@ def place_item_in_layer(
     position: CandidatePosition,
     layer_number: int,
 ) -> None:
-    """
-    Actually places the item into the layer.
-    """
-
-    placement = Placement(
-        csv_row_number=item.csv_row_number,
-        copy_number=item.copy_number,
-        x=position.x,
-        y=position.y,
-        z=layer.z,
-        length=orientation.length,
-        width=orientation.width,
-        height=orientation.height,
-        orientation=orientation.label,
-        layer_number=layer_number,
+    layer.placements.append(
+        Placement(
+            csv_row_number=item.csv_row_number,
+            copy_number=item.copy_number,
+            x=position.x,
+            y=position.y,
+            z=layer.z,
+            length=orientation.length,
+            width=orientation.width,
+            height=orientation.height,
+            orientation=orientation.label,
+            layer_number=layer_number,
+        )
     )
-
-    layer.placements.append(placement)
 
 
 # ============================================================
-# SAFE CENTERING / POST-PROCESSING
+# VALIDATION / CENTERING
 # ============================================================
 
 def get_layer_bounds(layer: Layer) -> tuple[float, float, float, float] | None:
-    """
-    Returns the bounding box of one layer.
-
-    Returns:
-        min_x, max_x, min_y, max_y
-    """
-
     if not layer.placements:
         return None
 
     min_x = min(p.x for p in layer.placements)
     max_x = max(p.x + p.length for p in layer.placements)
-
     min_y = min(p.y for p in layer.placements)
     max_y = max(p.y + p.width for p in layer.placements)
 
@@ -546,16 +672,11 @@ def get_layer_bounds(layer: Layer) -> tuple[float, float, float, float] | None:
 
 
 def get_plan_bounds(plan: SkidPlan) -> tuple[float, float, float, float] | None:
-    """
-    Returns the bounding box of the whole packed load.
-    """
-
     if not plan.placements:
         return None
 
     min_x = min(p.x for p in plan.placements)
     max_x = max(p.x + p.length for p in plan.placements)
-
     min_y = min(p.y for p in plan.placements)
     max_y = max(p.y + p.width for p in plan.placements)
 
@@ -563,10 +684,6 @@ def get_plan_bounds(plan: SkidPlan) -> tuple[float, float, float, float] | None:
 
 
 def shift_layer(layer: Layer, dx: float, dy: float) -> Layer:
-    """
-    Shifts every placement in one layer by dx/dy.
-    """
-
     shifted_placements = []
 
     for p in layer.placements:
@@ -588,7 +705,6 @@ def shift_layer(layer: Layer, dx: float, dy: float) -> Layer:
     return Layer(
         z=layer.z,
         height=layer.height,
-        strips=[],
         placements=shifted_placements,
     )
 
@@ -599,14 +715,6 @@ def shift_layers_from_index(
     dx: float,
     dy: float,
 ) -> list[Layer]:
-    """
-    Shifts one layer and every layer above it.
-
-    This is important:
-    If we shift layer 3, we also shift layers 4, 5, etc.
-    That preserves the support relationship between upper layers.
-    """
-
     shifted_layers = []
 
     for index, layer in enumerate(layers):
@@ -619,10 +727,6 @@ def shift_layers_from_index(
 
 
 def layer_has_collisions(layer: Layer) -> bool:
-    """
-    Checks whether any cartons overlap inside the same layer.
-    """
-
     placements = layer.placements
 
     for i in range(len(placements)):
@@ -631,29 +735,13 @@ def layer_has_collisions(layer: Layer) -> bool:
         for j in range(i + 1, len(placements)):
             b = placements[j]
 
-            if rectangles_overlap(
-                x=a.x,
-                y=a.y,
-                length=a.length,
-                width=a.width,
-                placement=b,
-            ):
+            if rectangles_overlap(a.x, a.y, a.length, a.width, b):
                 return True
 
     return False
 
 
 def plan_is_valid(plan: SkidPlan) -> bool:
-    """
-    Validates a plan after centering.
-
-    Checks:
-    - no negative x/y
-    - no carton outside skid dimensions
-    - no same-layer collisions
-    - every upper layer is still supported by the layer below
-    """
-
     for layer in plan.layers:
         if layer_has_collisions(layer):
             return False
@@ -669,15 +757,12 @@ def plan_is_valid(plan: SkidPlan) -> bool:
                 return False
 
     for layer_index in range(1, len(plan.layers)):
-        below_layer = plan.layers[layer_index - 1]
-        upper_layer = plan.layers[layer_index]
-
-        support_zones = get_support_zones_from_layer(below_layer)
+        support_zones = get_support_zones_from_layer(plan.layers[layer_index - 1])
 
         if not support_zones:
             return False
 
-        for p in upper_layer.placements:
+        for p in plan.layers[layer_index].placements:
             valid, _, _ = check_support(
                 x=p.x,
                 y=p.y,
@@ -693,10 +778,6 @@ def plan_is_valid(plan: SkidPlan) -> bool:
 
 
 def rebuild_plan_with_layers(plan: SkidPlan, layers: list[Layer]) -> SkidPlan:
-    """
-    Creates a new SkidPlan with the same skid dimensions but new layer placements.
-    """
-
     return SkidPlan(
         skid_length=plan.skid_length,
         skid_width=plan.skid_width,
@@ -706,12 +787,6 @@ def rebuild_plan_with_layers(plan: SkidPlan, layers: list[Layer]) -> SkidPlan:
 
 
 def center_whole_plan_on_skid(plan: SkidPlan) -> SkidPlan:
-    """
-    Centers the entire packed load on the skid as one unit.
-
-    This preserves all support relationships because every layer moves together.
-    """
-
     bounds = get_plan_bounds(plan)
 
     if bounds is None:
@@ -744,24 +819,11 @@ def center_whole_plan_on_skid(plan: SkidPlan) -> SkidPlan:
 
 
 def center_upper_layers_safely(plan: SkidPlan) -> SkidPlan:
-    """
-    Tries to center each upper layer over the layer below it.
-
-    Important:
-    When shifting layer i, it also shifts every layer above i.
-    This keeps the stack above that layer together.
-
-    A shift is only accepted if the whole plan remains valid.
-    """
-
     current_plan = plan
 
     for layer_index in range(1, len(current_plan.layers)):
-        below_layer = current_plan.layers[layer_index - 1]
-        current_layer = current_plan.layers[layer_index]
-
-        below_bounds = get_layer_bounds(below_layer)
-        current_bounds = get_layer_bounds(current_layer)
+        below_bounds = get_layer_bounds(current_plan.layers[layer_index - 1])
+        current_bounds = get_layer_bounds(current_plan.layers[layer_index])
 
         if below_bounds is None or current_bounds is None:
             continue
@@ -797,18 +859,6 @@ def center_upper_layers_safely(plan: SkidPlan) -> SkidPlan:
 
 
 def center_plan_on_skid(plan: SkidPlan) -> SkidPlan:
-    """
-    Final centering pass.
-
-    Step 1:
-        Center the entire stack on the skid.
-
-    Step 2:
-        Try to center upper layers over their supporting layer.
-
-    Every move is validated before being accepted.
-    """
-
     centered = center_whole_plan_on_skid(plan)
     centered = center_upper_layers_safely(centered)
 
@@ -816,26 +866,46 @@ def center_plan_on_skid(plan: SkidPlan) -> SkidPlan:
 
 
 # ============================================================
-# PACKING FOR ONE WIDTH LIMIT
+# PACKING
 # ============================================================
+
+def packing_choice_score(
+    final_length_value: float,
+    final_width_value: float,
+    actual_height: float,
+    position: CandidatePosition,
+    layer_index: int,
+) -> tuple:
+    area = final_length_value * final_width_value
+
+    return (
+        area,
+        actual_height * HEIGHT_WEIGHT,
+        position.side_overhang * OVERHANG_SCORE_WEIGHT,
+        max(0.0, 1.0 - position.support_ratio) * OVERHANG_SCORE_WEIGHT,
+        position.support_waste * SUPPORT_WASTE_WEIGHT,
+        position.center_offset * CENTER_OFFSET_WEIGHT,
+        -layer_index,  # prefer higher existing layers when otherwise similar
+        final_length_value,
+        final_width_value,
+    )
+
+
+def make_layer(z: float, height: float) -> Layer:
+    return Layer(
+        z=z,
+        height=height,
+        placements=[],
+    )
+
 
 def pack_items_for_width(
     items: list[Item],
     width_limit: float,
+    length_limit: float | None,
 ) -> SkidPlan | None:
-    """
-    Tries to pack all cartons using one internal width limit.
-
-    This is the balanced version:
-        - Uses x/y layer packing
-        - Allows small overhang
-        - Allows support from multiple cartons below
-        - Prevents large unsupported floating cartons
-    """
-
     layers: list[Layer] = []
 
-    # Larger cartons first.
     sorted_items = sorted(
         items,
         key=lambda item: (
@@ -859,12 +929,13 @@ def pack_items_for_width(
             if orientation.width > width_limit + EPS:
                 continue
 
+            if length_limit is not None and orientation.length > length_limit + EPS:
+                continue
+
             if orientation.height > MAX_LOADED_HEIGHT + EPS:
                 continue
 
-            # --------------------------------------------------------
-            # Option 1: Existing layers
-            # --------------------------------------------------------
+            # Try existing layers.
             for layer_index, layer in enumerate(layers):
                 if layer_index == 0:
                     support_zones = None
@@ -878,6 +949,7 @@ def pack_items_for_width(
                     layer=layer,
                     orientation=orientation,
                     width_limit=width_limit,
+                    length_limit=length_limit,
                     support_zones=support_zones,
                 )
 
@@ -888,37 +960,30 @@ def pack_items_for_width(
                 new_internal_width = max(current_width, position.new_layer_width)
                 new_actual_height = current_height
 
-                final_length = new_internal_length + LENGTH_CLEARANCE
-                final_width = new_internal_width + WIDTH_CLEARANCE
-                final_height = max(MIN_OUTPUT_SKID_HEIGHT, new_actual_height)
+                skid_l = final_skid_length(new_internal_length)
+                skid_w = final_skid_width(new_internal_width)
 
-                if final_width > MAX_SKID_WIDTH + EPS:
+                if not is_within_skid_limits(skid_l, skid_w):
                     continue
 
-                if new_actual_height > MAX_LOADED_HEIGHT + EPS:
-                    continue
-
-                score = (
-                    final_length * final_width,
-                    new_actual_height,
-                    position.side_overhang * OVERHANG_SCORE_WEIGHT,
-                    -position.support_ratio,
-                    final_length,
-                    final_width,
+                score = packing_choice_score(
+                    final_length_value=skid_l,
+                    final_width_value=skid_w,
+                    actual_height=new_actual_height,
+                    position=position,
+                    layer_index=layer_index,
                 )
 
                 if best_score is None or score < best_score:
                     best_score = score
                     best_choice = (
-                        "existing_layer",
+                        "existing",
                         layer_index,
                         orientation,
                         position,
                     )
 
-            # --------------------------------------------------------
-            # Option 2: New layer
-            # --------------------------------------------------------
+            # Try new layer.
             new_actual_height = current_height + orientation.height
 
             if new_actual_height <= MAX_LOADED_HEIGHT + EPS:
@@ -932,17 +997,16 @@ def pack_items_for_width(
                     if not support_zones:
                         continue
 
-                new_layer = Layer(
+                new_layer = make_layer(
                     z=z,
                     height=orientation.height,
-                    strips=[],
-                    placements=[],
                 )
 
                 position = find_best_position_in_layer(
                     layer=new_layer,
                     orientation=orientation,
                     width_limit=width_limit,
+                    length_limit=length_limit,
                     support_zones=support_zones,
                 )
 
@@ -952,26 +1016,24 @@ def pack_items_for_width(
                 new_internal_length = max(current_length, position.new_layer_length)
                 new_internal_width = max(current_width, position.new_layer_width)
 
-                final_length = new_internal_length + LENGTH_CLEARANCE
-                final_width = new_internal_width + WIDTH_CLEARANCE
-                final_height = max(MIN_OUTPUT_SKID_HEIGHT, new_actual_height)
+                skid_l = final_skid_length(new_internal_length)
+                skid_w = final_skid_width(new_internal_width)
 
-                if final_width > MAX_SKID_WIDTH + EPS:
+                if not is_within_skid_limits(skid_l, skid_w):
                     continue
 
-                score = (
-                    final_length * final_width,
-                    new_actual_height,
-                    position.side_overhang * OVERHANG_SCORE_WEIGHT,
-                    -position.support_ratio,
-                    final_length,
-                    final_width,
+                score = packing_choice_score(
+                    final_length_value=skid_l,
+                    final_width_value=skid_w,
+                    actual_height=new_actual_height,
+                    position=position,
+                    layer_index=len(layers),
                 )
 
                 if best_score is None or score < best_score:
                     best_score = score
                     best_choice = (
-                        "new_layer",
+                        "new",
                         None,
                         orientation,
                         position,
@@ -982,7 +1044,7 @@ def pack_items_for_width(
 
         choice_type, layer_index, orientation, position = best_choice
 
-        if choice_type == "existing_layer":
+        if choice_type == "existing":
             layer = layers[layer_index]
 
             place_item_in_layer(
@@ -996,11 +1058,9 @@ def pack_items_for_width(
         else:
             z = current_actual_height(layers)
 
-            new_layer = Layer(
+            new_layer = make_layer(
                 z=z,
                 height=orientation.height,
-                strips=[],
-                placements=[],
             )
 
             layers.append(new_layer)
@@ -1017,24 +1077,29 @@ def pack_items_for_width(
     internal_width = current_internal_width(layers)
     actual_height = current_actual_height(layers)
 
-    skid_length = internal_length + LENGTH_CLEARANCE
-    skid_width = internal_width + WIDTH_CLEARANCE
-    skid_height = max(MIN_OUTPUT_SKID_HEIGHT, actual_height)
+    skid_l = final_skid_length(internal_length)
+    skid_w = final_skid_width(internal_width)
+    skid_h = max(MIN_OUTPUT_SKID_HEIGHT, actual_height)
 
-    if skid_width > MAX_SKID_WIDTH + EPS:
+    if not is_within_skid_limits(skid_l, skid_w):
         return None
 
     if actual_height > MAX_LOADED_HEIGHT + EPS:
         return None
 
     raw_plan = SkidPlan(
-        skid_length=skid_length,
-        skid_width=skid_width,
-        skid_height=skid_height,
+        skid_length=skid_l,
+        skid_width=skid_w,
+        skid_height=skid_h,
         layers=layers,
     )
 
-    return center_plan_on_skid(raw_plan)
+    centered = center_plan_on_skid(raw_plan)
+
+    if not plan_is_valid(centered):
+        return None
+
+    return centered
 
 
 # ============================================================
@@ -1042,10 +1107,6 @@ def pack_items_for_width(
 # ============================================================
 
 def generate_candidate_widths(items: list[Item]) -> list[float]:
-    """
-    Generates internal skid-width limits to test.
-    """
-
     lower_bound = 0.0
 
     for item in items:
@@ -1060,79 +1121,107 @@ def generate_candidate_widths(items: list[Item]) -> list[float]:
 
         lower_bound = max(lower_bound, min(possible_widths))
 
-    if lower_bound > MAX_INTERNAL_CARTON_WIDTH + EPS:
+    if lower_bound > max_internal_width() + EPS:
         return []
 
     widths = set()
 
-    widths.add(round(MAX_INTERNAL_CARTON_WIDTH, 4))
+    widths.add(round(max_internal_width(), 4))
 
     start = math.ceil(lower_bound / WIDTH_STEP) * WIDTH_STEP
     width = start
 
-    while width <= MAX_INTERNAL_CARTON_WIDTH + EPS:
+    while width <= max_internal_width() + EPS:
         widths.add(round(width, 4))
         width += WIDTH_STEP
 
+    all_widths = []
+
     for item in items:
         for orientation in get_orientations(item.carton):
-            if orientation.width <= MAX_INTERNAL_CARTON_WIDTH + EPS:
+            if orientation.width <= max_internal_width() + EPS:
                 widths.add(round(orientation.width, 4))
+                all_widths.append(orientation.width)
+
+    # Try common 2-carton width combinations.
+    for a in all_widths:
+        for b in all_widths:
+            total = a + b
+
+            if total <= max_internal_width() + EPS:
+                widths.add(round(total, 4))
 
     return sorted(widths)
 
 
 # ============================================================
-# MAIN OPTIMIZER
+# FINAL PLAN SCORING
 # ============================================================
 
+def plan_support_score(plan: SkidPlan) -> tuple[float, float, float]:
+    total_overhang = 0.0
+    total_support_loss = 0.0
+    total_waste = 0.0
+
+    for layer_index in range(1, len(plan.layers)):
+        support_zones = get_support_zones_from_layer(plan.layers[layer_index - 1])
+
+        for p in plan.layers[layer_index].placements:
+            valid, support_ratio, side_overhang = check_support(
+                x=p.x,
+                y=p.y,
+                length=p.length,
+                width=p.width,
+                support_zones=support_zones,
+            )
+
+            if not valid:
+                total_overhang += 1_000_000.0
+                total_support_loss += 1_000_000.0
+                continue
+
+            total_overhang += side_overhang
+            total_support_loss += max(0.0, 1.0 - support_ratio)
+
+            total_waste += support_waste(
+                x=p.x,
+                y=p.y,
+                length=p.length,
+                width=p.width,
+                support_zones=support_zones,
+            )
+
+    return total_overhang, total_support_loss, total_waste
+
+
 def optimize_one_skid_for_all_items(items: list[Item]) -> SkidPlan | None:
-    """
-    Finds one skid size that fits all cartons.
-
-    Best means:
-        1. Smallest skid footprint
-        2. Smaller actual height
-        3. Less overhang
-        4. Smaller length/width
-    """
-
     if not items:
         return None
 
     best_plan = None
     best_score = None
 
+    length_limit = max_internal_length()
+
     for width_limit in generate_candidate_widths(items):
-        plan = pack_items_for_width(items, width_limit)
+        plan = pack_items_for_width(
+            items=items,
+            width_limit=width_limit,
+            length_limit=length_limit,
+        )
 
         if plan is None:
             continue
 
         actual_height = current_actual_height(plan.layers)
-
-        # Calculate total overhang warning score for final plan.
-        total_overhang_score = 0.0
-
-        for layer_index in range(1, len(plan.layers)):
-            support_zones = get_support_zones_from_layer(plan.layers[layer_index - 1])
-
-            for placement in plan.layers[layer_index].placements:
-                valid, support_ratio, side_overhang = check_support(
-                    x=placement.x,
-                    y=placement.y,
-                    length=placement.length,
-                    width=placement.width,
-                    support_zones=support_zones,
-                )
-
-                total_overhang_score += side_overhang
-                total_overhang_score += max(0.0, MIN_SUPPORT_RATIO - support_ratio) * 100
+        total_overhang, support_loss, waste = plan_support_score(plan)
 
         score = (
             plan.area,
-            actual_height,
-            total_overhang_score * OVERHANG_SCORE_WEIGHT,
+            actual_height * HEIGHT_WEIGHT,
+            total_overhang * OVERHANG_SCORE_WEIGHT,
+            support_loss * OVERHANG_SCORE_WEIGHT,
+            waste * SUPPORT_WASTE_WEIGHT,
             plan.skid_length,
             plan.skid_width,
             plan.skid_height,
