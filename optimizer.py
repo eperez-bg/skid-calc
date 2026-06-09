@@ -406,6 +406,11 @@ def candidate_xy_points(
             # Align both right/back edges.
             points.add((zone.x2 - orientation.length, zone.y2 - orientation.width))
 
+            # Align carton centered on the support zone (both axes).
+            center_x = zone.x + (zone.length - orientation.length) / 2.0
+            center_y = zone.y + (zone.width - orientation.width) / 2.0
+            points.add((center_x, center_y))
+
             # Allow small overhang around the zone.
             points.add((zone.x - MAX_SIDE_OVERHANG, zone.y))
             points.add((zone.x, zone.y - MAX_SIDE_OVERHANG))
@@ -514,6 +519,300 @@ def place_item_in_layer(
     )
 
     layer.placements.append(placement)
+
+
+# ============================================================
+# SAFE CENTERING / POST-PROCESSING
+# ============================================================
+
+def get_layer_bounds(layer: Layer) -> tuple[float, float, float, float] | None:
+    """
+    Returns the bounding box of one layer.
+
+    Returns:
+        min_x, max_x, min_y, max_y
+    """
+
+    if not layer.placements:
+        return None
+
+    min_x = min(p.x for p in layer.placements)
+    max_x = max(p.x + p.length for p in layer.placements)
+
+    min_y = min(p.y for p in layer.placements)
+    max_y = max(p.y + p.width for p in layer.placements)
+
+    return min_x, max_x, min_y, max_y
+
+
+def get_plan_bounds(plan: SkidPlan) -> tuple[float, float, float, float] | None:
+    """
+    Returns the bounding box of the whole packed load.
+    """
+
+    if not plan.placements:
+        return None
+
+    min_x = min(p.x for p in plan.placements)
+    max_x = max(p.x + p.length for p in plan.placements)
+
+    min_y = min(p.y for p in plan.placements)
+    max_y = max(p.y + p.width for p in plan.placements)
+
+    return min_x, max_x, min_y, max_y
+
+
+def shift_layer(layer: Layer, dx: float, dy: float) -> Layer:
+    """
+    Shifts every placement in one layer by dx/dy.
+    """
+
+    shifted_placements = []
+
+    for p in layer.placements:
+        shifted_placements.append(
+            Placement(
+                csv_row_number=p.csv_row_number,
+                copy_number=p.copy_number,
+                x=p.x + dx,
+                y=p.y + dy,
+                z=p.z,
+                length=p.length,
+                width=p.width,
+                height=p.height,
+                orientation=p.orientation,
+                layer_number=p.layer_number,
+            )
+        )
+
+    return Layer(
+        z=layer.z,
+        height=layer.height,
+        strips=[],
+        placements=shifted_placements,
+    )
+
+
+def shift_layers_from_index(
+    layers: list[Layer],
+    start_index: int,
+    dx: float,
+    dy: float,
+) -> list[Layer]:
+    """
+    Shifts one layer and every layer above it.
+
+    This is important:
+    If we shift layer 3, we also shift layers 4, 5, etc.
+    That preserves the support relationship between upper layers.
+    """
+
+    shifted_layers = []
+
+    for index, layer in enumerate(layers):
+        if index >= start_index:
+            shifted_layers.append(shift_layer(layer, dx, dy))
+        else:
+            shifted_layers.append(layer)
+
+    return shifted_layers
+
+
+def layer_has_collisions(layer: Layer) -> bool:
+    """
+    Checks whether any cartons overlap inside the same layer.
+    """
+
+    placements = layer.placements
+
+    for i in range(len(placements)):
+        a = placements[i]
+
+        for j in range(i + 1, len(placements)):
+            b = placements[j]
+
+            if rectangles_overlap(
+                x=a.x,
+                y=a.y,
+                length=a.length,
+                width=a.width,
+                placement=b,
+            ):
+                return True
+
+    return False
+
+
+def plan_is_valid(plan: SkidPlan) -> bool:
+    """
+    Validates a plan after centering.
+
+    Checks:
+    - no negative x/y
+    - no carton outside skid dimensions
+    - no same-layer collisions
+    - every upper layer is still supported by the layer below
+    """
+
+    for layer in plan.layers:
+        if layer_has_collisions(layer):
+            return False
+
+        for p in layer.placements:
+            if p.x < -EPS or p.y < -EPS:
+                return False
+
+            if p.x + p.length > plan.skid_length + EPS:
+                return False
+
+            if p.y + p.width > plan.skid_width + EPS:
+                return False
+
+    for layer_index in range(1, len(plan.layers)):
+        below_layer = plan.layers[layer_index - 1]
+        upper_layer = plan.layers[layer_index]
+
+        support_zones = get_support_zones_from_layer(below_layer)
+
+        if not support_zones:
+            return False
+
+        for p in upper_layer.placements:
+            valid, _, _ = check_support(
+                x=p.x,
+                y=p.y,
+                length=p.length,
+                width=p.width,
+                support_zones=support_zones,
+            )
+
+            if not valid:
+                return False
+
+    return True
+
+
+def rebuild_plan_with_layers(plan: SkidPlan, layers: list[Layer]) -> SkidPlan:
+    """
+    Creates a new SkidPlan with the same skid dimensions but new layer placements.
+    """
+
+    return SkidPlan(
+        skid_length=plan.skid_length,
+        skid_width=plan.skid_width,
+        skid_height=plan.skid_height,
+        layers=layers,
+    )
+
+
+def center_whole_plan_on_skid(plan: SkidPlan) -> SkidPlan:
+    """
+    Centers the entire packed load on the skid as one unit.
+
+    This preserves all support relationships because every layer moves together.
+    """
+
+    bounds = get_plan_bounds(plan)
+
+    if bounds is None:
+        return plan
+
+    min_x, max_x, min_y, max_y = bounds
+
+    used_length = max_x - min_x
+    used_width = max_y - min_y
+
+    target_min_x = (plan.skid_length - used_length) / 2
+    target_min_y = (plan.skid_width - used_width) / 2
+
+    dx = target_min_x - min_x
+    dy = target_min_y - min_y
+
+    shifted_layers = shift_layers_from_index(
+        layers=plan.layers,
+        start_index=0,
+        dx=dx,
+        dy=dy,
+    )
+
+    centered_plan = rebuild_plan_with_layers(plan, shifted_layers)
+
+    if plan_is_valid(centered_plan):
+        return centered_plan
+
+    return plan
+
+
+def center_upper_layers_safely(plan: SkidPlan) -> SkidPlan:
+    """
+    Tries to center each upper layer over the layer below it.
+
+    Important:
+    When shifting layer i, it also shifts every layer above i.
+    This keeps the stack above that layer together.
+
+    A shift is only accepted if the whole plan remains valid.
+    """
+
+    current_plan = plan
+
+    for layer_index in range(1, len(current_plan.layers)):
+        below_layer = current_plan.layers[layer_index - 1]
+        current_layer = current_plan.layers[layer_index]
+
+        below_bounds = get_layer_bounds(below_layer)
+        current_bounds = get_layer_bounds(current_layer)
+
+        if below_bounds is None or current_bounds is None:
+            continue
+
+        below_min_x, below_max_x, below_min_y, below_max_y = below_bounds
+        current_min_x, current_max_x, current_min_y, current_max_y = current_bounds
+
+        below_length = below_max_x - below_min_x
+        below_width = below_max_y - below_min_y
+
+        current_length = current_max_x - current_min_x
+        current_width = current_max_y - current_min_y
+
+        target_min_x = below_min_x + (below_length - current_length) / 2
+        target_min_y = below_min_y + (below_width - current_width) / 2
+
+        dx = target_min_x - current_min_x
+        dy = target_min_y - current_min_y
+
+        shifted_layers = shift_layers_from_index(
+            layers=current_plan.layers,
+            start_index=layer_index,
+            dx=dx,
+            dy=dy,
+        )
+
+        candidate_plan = rebuild_plan_with_layers(current_plan, shifted_layers)
+
+        if plan_is_valid(candidate_plan):
+            current_plan = candidate_plan
+
+    return current_plan
+
+
+def center_plan_on_skid(plan: SkidPlan) -> SkidPlan:
+    """
+    Final centering pass.
+
+    Step 1:
+        Center the entire stack on the skid.
+
+    Step 2:
+        Try to center upper layers over their supporting layer.
+
+    Every move is validated before being accepted.
+    """
+
+    centered = center_whole_plan_on_skid(plan)
+    centered = center_upper_layers_safely(centered)
+
+    return centered
 
 
 # ============================================================
@@ -728,12 +1027,14 @@ def pack_items_for_width(
     if actual_height > MAX_LOADED_HEIGHT + EPS:
         return None
 
-    return SkidPlan(
+    raw_plan = SkidPlan(
         skid_length=skid_length,
         skid_width=skid_width,
         skid_height=skid_height,
         layers=layers,
     )
+
+    return center_plan_on_skid(raw_plan)
 
 
 # ============================================================
