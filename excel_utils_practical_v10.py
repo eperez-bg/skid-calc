@@ -9,13 +9,13 @@ from openpyxl import load_workbook
 from openpyxl.utils import range_boundaries
 
 from models import Carton, Item
-from optimizer_practical_v9 import (
+from optimizer_practical_v10 import (
     optimize_one_skid_for_all_items,
     create_failure_visualization_plan,
     print_elapsed,
 )
 from visualizer_plotly import export_plan_to_plotly_html
-from all_skids_visualizer_practical_v9 import export_all_skids_to_plotly_html
+from all_skids_visualizer_practical_v10 import export_all_skids_to_plotly_html
 
 
 DIMENSION_COLS = (1, 2, 3)

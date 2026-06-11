@@ -14,6 +14,47 @@ COLORS = [
 ]
 
 
+def darker_hex(hex_color: str, factor: float = 0.55) -> str:
+    """
+    Creates a darker version of a color for carton edge outlines.
+    """
+
+    hex_color = hex_color.lstrip("#")
+
+    r = int(hex_color[0:2], 16)
+    g = int(hex_color[2:4], 16)
+    b = int(hex_color[4:6], 16)
+
+    r = max(0, min(255, int(r * factor)))
+    g = max(0, min(255, int(g * factor)))
+    b = max(0, min(255, int(b * factor)))
+
+    return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def box_vertices(
+    x: float,
+    y: float,
+    z: float,
+    length: float,
+    width: float,
+    height: float,
+) -> tuple[list[float], list[float], list[float]]:
+    """
+    Returns the 8 vertices of a rectangular carton.
+    """
+
+    x0, x1 = x, x + length
+    y0, y1 = y, y + width
+    z0, z1 = z, z + height
+
+    xs = [x0, x1, x1, x0, x0, x1, x1, x0]
+    ys = [y0, y0, y1, y1, y0, y0, y1, y1]
+    zs = [z0, z0, z0, z0, z1, z1, z1, z1]
+
+    return xs, ys, zs
+
+
 def box_mesh(
     x: float,
     y: float,
@@ -27,26 +68,31 @@ def box_mesh(
     opacity: float = 1.0,
 ) -> go.Mesh3d:
     """
-    Creates a rectangular prism for Plotly.
+    Creates a solid rectangular prism.
+
+    The important fix is the triangle indexing. The old face list could make
+    boxes look like incomplete folded planes from some camera angles.
     """
 
-    x0, x1 = x, x + length
-    y0, y1 = y, y + width
-    z0, z1 = z, z + height
+    xs, ys, zs = box_vertices(
+        x=x,
+        y=y,
+        z=z,
+        length=length,
+        width=width,
+        height=height,
+    )
 
-    vertices_x = [x0, x1, x1, x0, x0, x1, x1, x0]
-    vertices_y = [y0, y0, y1, y1, y0, y0, y1, y1]
-    vertices_z = [z0, z0, z0, z0, z1, z1, z1, z1]
-
-    # 12 triangles, 2 for each face.
-    i = [0, 0, 0, 4, 4, 4, 0, 1, 2, 3, 0, 1]
-    j = [1, 2, 4, 5, 6, 0, 3, 2, 3, 0, 5, 6]
-    k = [2, 3, 5, 6, 7, 7, 7, 6, 7, 4, 6, 2]
+    # 12 triangles: 2 triangles for each of the 6 faces.
+    # bottom, top, front, right, back, left.
+    i = [0, 0, 4, 4, 0, 0, 1, 1, 2, 2, 3, 3]
+    j = [1, 2, 5, 6, 1, 5, 2, 6, 3, 7, 0, 4]
+    k = [2, 3, 6, 7, 5, 4, 6, 5, 7, 6, 4, 7]
 
     return go.Mesh3d(
-        x=vertices_x,
-        y=vertices_y,
-        z=vertices_z,
+        x=xs,
+        y=ys,
+        z=zs,
         i=i,
         j=j,
         k=k,
@@ -56,7 +102,65 @@ def box_mesh(
         hovertext=hover_text,
         hoverinfo="text",
         flatshading=True,
+        lighting=dict(
+            ambient=0.55,
+            diffuse=0.80,
+            fresnel=0.10,
+            specular=0.15,
+            roughness=0.65,
+        ),
+        lightposition=dict(x=100, y=200, z=300),
         showscale=False,
+    )
+
+
+def box_edges(
+    x: float,
+    y: float,
+    z: float,
+    length: float,
+    width: float,
+    height: float,
+    color: str,
+) -> go.Scatter3d:
+    """
+    Draws crisp edges around a carton.
+
+    Mesh3d does not draw outlines, so adding edges makes the boxes look finished.
+    """
+
+    xs, ys, zs = box_vertices(
+        x=x,
+        y=y,
+        z=z,
+        length=length,
+        width=width,
+        height=height,
+    )
+
+    edge_pairs = [
+        (0, 1), (1, 2), (2, 3), (3, 0),
+        (4, 5), (5, 6), (6, 7), (7, 4),
+        (0, 4), (1, 5), (2, 6), (3, 7),
+    ]
+
+    line_x = []
+    line_y = []
+    line_z = []
+
+    for a, b in edge_pairs:
+        line_x.extend([xs[a], xs[b], None])
+        line_y.extend([ys[a], ys[b], None])
+        line_z.extend([zs[a], zs[b], None])
+
+    return go.Scatter3d(
+        x=line_x,
+        y=line_y,
+        z=line_z,
+        mode="lines",
+        line=dict(color=color, width=3),
+        hoverinfo="skip",
+        showlegend=False,
     )
 
 
@@ -84,7 +188,19 @@ def make_plan_figure(plan: Any, title: str) -> go.Figure:
                 f"Width: {round(plan.skid_width, 2)}<br>"
                 f"Height: {round(plan.skid_height, 2)}"
             ),
-            opacity=0.45,
+            opacity=0.55,
+        )
+    )
+
+    fig.add_trace(
+        box_edges(
+            x=0,
+            y=0,
+            z=-0.35,
+            length=plan.skid_length,
+            width=plan.skid_width,
+            height=0.35,
+            color="#8b7355",
         )
     )
 
@@ -93,6 +209,7 @@ def make_plan_figure(plan: Any, title: str) -> go.Figure:
     for layer in plan.layers:
         for placement in layer.placements:
             color = COLORS[color_index % len(COLORS)]
+            edge_color = darker_hex(color)
             color_index += 1
 
             hover_text = (
@@ -122,22 +239,50 @@ def make_plan_figure(plan: Any, title: str) -> go.Figure:
                 )
             )
 
+            fig.add_trace(
+                box_edges(
+                    x=placement.x,
+                    y=placement.y,
+                    z=placement.z,
+                    length=placement.length,
+                    width=placement.width,
+                    height=placement.height,
+                    color=edge_color,
+                )
+            )
+
     fig.update_layout(
         title=title,
         scene=dict(
             xaxis_title="Skid Length / X",
             yaxis_title="Skid Width / Y",
             zaxis_title="Skid Height / Z",
-            xaxis=dict(range=[0, max(plan.skid_length, 1)]),
-            yaxis=dict(range=[0, max(plan.skid_width, 1)]),
-            zaxis=dict(range=[0, max(plan.skid_height, 1)]),
+            xaxis=dict(
+                range=[0, max(plan.skid_length, 1)],
+                showbackground=True,
+                backgroundcolor="#eef2f7",
+                gridcolor="#ffffff",
+            ),
+            yaxis=dict(
+                range=[0, max(plan.skid_width, 1)],
+                showbackground=True,
+                backgroundcolor="#eef2f7",
+                gridcolor="#ffffff",
+            ),
+            zaxis=dict(
+                range=[0, max(plan.skid_height, 1)],
+                showbackground=True,
+                backgroundcolor="#eef2f7",
+                gridcolor="#ffffff",
+            ),
             aspectmode="data",
             camera=dict(
-                eye=dict(x=1.6, y=1.6, z=0.9)
+                eye=dict(x=1.65, y=1.65, z=0.95),
+                center=dict(x=0, y=0, z=0),
             ),
         ),
         margin=dict(l=0, r=0, t=50, b=0),
-        height=700,
+        height=760,
         showlegend=False,
     )
 
@@ -151,8 +296,6 @@ def export_all_skids_to_plotly_html(
 ) -> None:
     """
     Writes one HTML file containing every group's skid visualization.
-
-    Each group gets its own Plotly 3D figure stacked vertically in the page.
     """
 
     output_path = Path(output_html_path)
